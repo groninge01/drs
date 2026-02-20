@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import math
 import platform
@@ -206,9 +207,25 @@ def _smooth(values: List[float], half_window: int) -> List[float]:
     return out
 
 
-def _lookahead_indices(cum_dist: List[float], distance_m: float) -> List[int]:
+def _lookahead_indices(cum_dist: List[float], distance_m: float, circular: bool = False) -> List[int]:
     n = len(cum_dist)
     out = [n - 1] * n
+    if n == 0:
+        return out
+    if circular:
+        total_len = cum_dist[-1]
+        if total_len <= 0.0:
+            return out
+        for i in range(n):
+            target = cum_dist[i] + distance_m
+            if target <= total_len:
+                j = bisect.bisect_left(cum_dist, target)
+                out[i] = min(n - 1, j)
+            else:
+                wrapped = target - total_len
+                j = bisect.bisect_left(cum_dist, wrapped)
+                out[i] = min(n - 1, j)
+        return out
     j = 0
     for i in range(n):
         if j < i:
@@ -220,9 +237,25 @@ def _lookahead_indices(cum_dist: List[float], distance_m: float) -> List[int]:
     return out
 
 
-def _lookback_indices(cum_dist: List[float], distance_m: float) -> List[int]:
+def _lookback_indices(cum_dist: List[float], distance_m: float, circular: bool = False) -> List[int]:
     n = len(cum_dist)
     out = [0] * n
+    if n == 0:
+        return out
+    if circular:
+        total_len = cum_dist[-1]
+        if total_len <= 0.0:
+            return out
+        for i in range(n):
+            target = cum_dist[i] - distance_m
+            if target >= 0.0:
+                j = bisect.bisect_left(cum_dist, target)
+                out[i] = min(n - 1, j)
+            else:
+                wrapped = target + total_len
+                j = bisect.bisect_left(cum_dist, wrapped)
+                out[i] = min(n - 1, j)
+        return out
     j = n - 1
     for i in range(n - 1, -1, -1):
         if j > i:
@@ -232,6 +265,14 @@ def _lookback_indices(cum_dist: List[float], distance_m: float) -> List[int]:
             j -= 1
         out[i] = j
     return out
+
+
+def _forward_indices(start_idx: int, end_idx: int, n: int) -> List[int]:
+    if n <= 0:
+        return []
+    if start_idx <= end_idx:
+        return list(range(start_idx, end_idx + 1))
+    return list(range(start_idx, n)) + list(range(0, end_idx + 1))
 
 
 def _has_brake_reset(samples: List[RefSample], start_idx: int, end_idx: int, release_threshold: float = 0.05) -> bool:
@@ -254,12 +295,13 @@ def extract_corners(samples: List[RefSample]) -> List[BrakeZone]:
         seg_dist[i] = max(0.05, d)
         cum_dist[i] = cum_dist[i - 1] + seg_dist[i]
         heading[i] = _bearing_rad(samples[i - 1].lat, samples[i - 1].lon, samples[i].lat, samples[i].lon)
+    heading[0] = _bearing_rad(samples[-1].lat, samples[-1].lon, samples[0].lat, samples[0].lon)
 
-    look_ahead_120 = _lookahead_indices(cum_dist, 120.0)
-    look_ahead_250 = _lookahead_indices(cum_dist, 250.0)
-    look_ahead_500 = _lookahead_indices(cum_dist, 500.0)
-    look_back_120 = _lookback_indices(cum_dist, 120.0)
-    look_back_250 = _lookback_indices(cum_dist, 250.0)
+    look_ahead_120 = _lookahead_indices(cum_dist, 120.0, circular=True)
+    look_ahead_250 = _lookahead_indices(cum_dist, 250.0, circular=True)
+    look_ahead_500 = _lookahead_indices(cum_dist, 500.0, circular=True)
+    look_back_120 = _lookback_indices(cum_dist, 120.0, circular=True)
+    look_back_250 = _lookback_indices(cum_dist, 250.0, circular=True)
 
     turn_score_deg = [0.0] * n
     for i in range(1, n - 1):
@@ -291,17 +333,26 @@ def extract_corners(samples: List[RefSample]) -> List[BrakeZone]:
     # Keep strongest peaks first, then enforce spatial spacing to avoid duplicates.
     raw_candidates.sort(key=lambda item: item[1], reverse=True)
     selected_centers: List[int] = []
-    min_center_sep_m = 75.0
+    min_center_sep_m = 55.0
     for center_idx, _score in raw_candidates:
         if any(abs(cum_dist[center_idx] - cum_dist[other]) < min_center_sep_m for other in selected_centers):
             continue
         selected_centers.append(center_idx)
+
+    # Add brake-onset candidates as a safety net, so real braking corners are not missed.
+    brake_event_threshold = 0.08
+    brake_event_sep_m = 45.0
+    for i in range(1, n):
+        if samples[i - 1].brake < brake_event_threshold <= samples[i].brake:
+            if any(abs(cum_dist[i] - cum_dist[other]) < brake_event_sep_m for other in selected_centers):
+                continue
+            selected_centers.append(i)
     selected_centers.sort()
 
     corners: List[BrakeZone] = []
     used_apex_dist: List[float] = []
-    min_action_sep_m = 60.0
-    min_apex_sep_m = 55.0
+    min_action_sep_m = 45.0
+    min_apex_sep_m = 40.0
 
     throttle_drop_threshold = 0.10
     brake_start_threshold = 0.06
@@ -321,28 +372,40 @@ def extract_corners(samples: List[RefSample]) -> List[BrakeZone]:
         action_search_start = max(1, look_back_250[apex_idx])
         action_idx = max(1, look_back_120[apex_idx])
         action_type = "flat"
+        search_window = _forward_indices(action_search_start, apex_idx, n)
+        if len(search_window) < 2:
+            continue
 
         brake_idx: Optional[int] = None
-        for j in range(apex_idx, action_search_start, -1):
-            if samples[j - 1].brake < brake_start_threshold <= samples[j].brake:
+        for j in reversed(search_window):
+            prev_j = j - 1 if j > 0 else n - 1
+            if samples[prev_j].brake < brake_start_threshold <= samples[j].brake:
                 brake_idx = j
                 break
         if brake_idx is None:
-            peak_brake_pre = max(samples[j].brake for j in range(action_search_start, apex_idx + 1))
+            peak_brake_pre = max(samples[j].brake for j in search_window)
             if peak_brake_pre >= 0.12:
                 last_brake_idx = max(
-                    (j for j in range(action_search_start, apex_idx + 1) if samples[j].brake >= 0.12),
+                    (j for j in search_window if samples[j].brake >= 0.12),
                     default=None,
                 )
                 if last_brake_idx is not None:
                     j = last_brake_idx
-                    while j > action_search_start and samples[j - 1].brake >= brake_start_threshold:
-                        j -= 1
+                    guard = 0
+                    while guard < n:
+                        prev_j = j - 1 if j > 0 else n - 1
+                        if prev_j == action_search_start:
+                            break
+                        if samples[prev_j].brake < brake_start_threshold:
+                            break
+                        j = prev_j
+                        guard += 1
                     brake_idx = j
 
         lift_idx: Optional[int] = None
-        for j in range(apex_idx, action_search_start, -1):
-            throttle_drop = samples[j - 1].throttle - samples[j].throttle
+        for j in reversed(search_window):
+            prev_j = j - 1 if j > 0 else n - 1
+            throttle_drop = samples[prev_j].throttle - samples[j].throttle
             if throttle_drop >= throttle_drop_threshold and samples[j].throttle <= 0.98:
                 lift_idx = j
                 break
@@ -370,8 +433,9 @@ def extract_corners(samples: List[RefSample]) -> List[BrakeZone]:
 
         seg_start = look_back_120[apex_idx]
         seg_end = look_ahead_120[apex_idx]
-        seg_speed_hi = max(speed[seg_start : seg_end + 1])
-        seg_speed_lo = min(speed[seg_start : seg_end + 1])
+        seg_window = _forward_indices(seg_start, seg_end, n)
+        seg_speed_hi = max(speed[j] for j in seg_window)
+        seg_speed_lo = min(speed[j] for j in seg_window)
         speed_drop_kph = (seg_speed_hi - seg_speed_lo) * 3.6
         turn_near = abs(math.degrees(_angle_diff_rad(heading[look_ahead_120[apex_idx]], heading[look_back_120[apex_idx]])))
         turn_far = abs(math.degrees(_angle_diff_rad(heading[look_ahead_250[apex_idx]], heading[look_back_120[apex_idx]])))
@@ -384,11 +448,11 @@ def extract_corners(samples: List[RefSample]) -> List[BrakeZone]:
                 continue
 
         end_i = min(n - 1, look_ahead_120[apex_idx])
-        chunk = samples[action_idx : end_i + 1]
+        chunk = [samples[j] for j in _forward_indices(action_idx, end_i, n)]
         driving_gears = [x.gear for x in chunk if x.gear > 0]
         min_gear = min(driving_gears) if driving_gears else max(samples[action_idx].gear, 1)
         approach_i = max(0, look_back_120[action_idx])
-        min_speed_idx = min(range(seg_start, seg_end + 1), key=lambda j: speed[j])
+        min_speed_idx = min(seg_window, key=lambda j: speed[j])
 
         corners.append(
             BrakeZone(
@@ -537,6 +601,15 @@ def build_short_target_phrase(zone: BrakeZone, current_gear: int) -> str:
     return f"{speed_spoken}, {gear_part}"
 
 
+def is_significant_action(zone: BrakeZone) -> bool:
+    speed_drop_mps = max(0.0, zone.approach_speed_mps - zone.min_speed_mps)
+    if zone.action_type == "brake":
+        return zone.peak_brake >= 0.12 or speed_drop_mps >= 4.0
+    if zone.action_type == "lift":
+        return speed_drop_mps >= 2.5
+    return False
+
+
 def reference_track_length_m(samples: List[RefSample]) -> Optional[float]:
     if len(samples) < 2:
         return None
@@ -585,6 +658,7 @@ def run_live(
     action_target: str,
     distance_callout_unit: str,
     cue_cooldown_seconds: float,
+    now_lead_seconds: float,
     voice_contains: Optional[str],
 ) -> None:
     if irsdk is None:
@@ -670,12 +744,12 @@ def run_live(
             # not at a large lead time. Window is short to align with actual brake application.
             if track_len:
                 action_pct = _clamp(
-                    (speed_mps * 0.20) / track_len,
+                    (speed_mps * now_lead_seconds) / track_len,
                     min_lookahead_pct * 0.05,
-                    max_lookahead_pct * 0.20,
+                    max_lookahead_pct * 0.40,
                 )
             else:
-                action_pct = min_lookahead_pct * 0.10
+                action_pct = min_lookahead_pct * 0.20
 
             if (
                 not state.prepare_done
@@ -703,11 +777,7 @@ def run_live(
                 not state.action_done
                 and d_pct <= action_pct
             ):
-                if zone.action_type == "flat":
-                    speaker.say("Flat.")
-                elif zone.action_type == "lift" and zone.peak_brake < 0.05:
-                    speaker.say("Lift now.")
-                else:
+                if is_significant_action(zone):
                     speaker.say("Now.")
                 state.action_done = True
                 last_spoken_time = now
@@ -756,6 +826,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--cue-cooldown-seconds", type=float, default=1.0)
     p.add_argument(
+        "--now-lead-seconds",
+        type=float,
+        default=0.45,
+        help="Advance for 'Now.' cue to compensate speech latency",
+    )
+    p.add_argument(
         "--voice-contains",
         type=str,
         default=None,
@@ -785,6 +861,7 @@ def main() -> None:
         action_target=args.action_target,
         distance_callout_unit=args.distance_callout_unit,
         cue_cooldown_seconds=args.cue_cooldown_seconds,
+        now_lead_seconds=args.now_lead_seconds,
         voice_contains=args.voice_contains,
     )
 
