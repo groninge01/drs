@@ -412,14 +412,16 @@ def run_live(
             d_m = pct_to_meters(track_len, d_pct)
             lead_callout = format_distance_callout(d_m, speed_mps, distance_callout_unit)
 
+            # Trigger "Now." close to the reference brake-onset sample (zone.start_pct),
+            # not at a large lead time. Window is short to align with actual brake application.
             if track_len:
                 action_pct = _clamp(
-                    (speed_mps * action_lead_seconds) / track_len,
-                    min_lookahead_pct * 0.25,
-                    max_lookahead_pct,
+                    (speed_mps * 0.20) / track_len,
+                    min_lookahead_pct * 0.05,
+                    max_lookahead_pct * 0.20,
                 )
             else:
-                action_pct = min_lookahead_pct
+                action_pct = min_lookahead_pct * 0.10
 
             if (
                 not state.prepare_done
