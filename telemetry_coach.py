@@ -282,7 +282,7 @@ def extract_engineer_events(samples: List[RefSample]) -> List[EngineerEvent]:
             continue
         filtered.append((idx, action, strength))
 
-    indexed_events: List[tuple[int, EngineerEvent]] = []
+    indexed_events: List[tuple[int, int, EngineerEvent]] = []
     for idx, action, _strength in filtered:
         end_idx = ahead_120[idx]
         eval_idx = ahead_250[idx]
@@ -311,9 +311,14 @@ def extract_engineer_events(samples: List[RefSample]) -> List[EngineerEvent]:
             target_speed = None
             target_throttle = int(round(min_throttle * 100.0))
 
+        # Skip trivial lift calls like "lift to 0%" unless they have major speed impact.
+        if final_action == "lift" and (target_throttle or 0) <= 8 and speed_drop_kph < 25:
+            continue
+
         indexed_events.append(
             (
                 idx,
+                min_speed_idx,
                 EngineerEvent(
                     index=0,
                     start_pct=samples[idx].lap_pct,
@@ -333,38 +338,87 @@ def extract_engineer_events(samples: List[RefSample]) -> List[EngineerEvent]:
 
     # Merge very close events; prefer brake when clustered.
     indexed_events.sort(key=lambda x: x[0])
-    merged: List[tuple[int, EngineerEvent]] = []
+    merged: List[tuple[int, int, EngineerEvent]] = []
     min_event_sep_m = 45.0
-    for idx, ev in indexed_events:
+    for idx, apex_idx, ev in indexed_events:
         if not merged:
-            merged.append((idx, ev))
+            merged.append((idx, apex_idx, ev))
             continue
-        prev_idx, prev_ev = merged[-1]
+        prev_idx, prev_apex_idx, prev_ev = merged[-1]
         gap_m = cum[idx] - cum[prev_idx]
+        apex_gap_m = _distance_between(cum, apex_idx, prev_apex_idx)
+
+        # If apexes are very close and starts are close, treat as same corner.
+        if apex_gap_m < 70.0 and gap_m < 120.0:
+            if ev.action_type == "brake" and prev_ev.action_type != "brake":
+                merged[-1] = (idx, apex_idx, ev)
+                continue
+            if ev.action_type == prev_ev.action_type == "brake":
+                prev_speed = prev_ev.target_min_speed_kph or 999
+                cur_speed = ev.target_min_speed_kph or 999
+                prev_gear = prev_ev.target_gear
+                cur_gear = ev.target_gear
+                if abs(cur_speed - prev_speed) <= 12 and abs(cur_gear - prev_gear) <= 1:
+                    # Very similar target profile: keep only one.
+                    if cur_speed < prev_speed:
+                        merged[-1] = (idx, apex_idx, ev)
+                    continue
+            if ev.action_type == prev_ev.action_type == "lift":
+                prev_throttle = prev_ev.target_throttle_pct or 100
+                cur_throttle = ev.target_throttle_pct or 100
+                if abs(cur_throttle - prev_throttle) <= 10:
+                    if cur_throttle < prev_throttle:
+                        merged[-1] = (idx, apex_idx, ev)
+                    continue
+            if ev.action_type != prev_ev.action_type:
+                if gap_m >= 90.0:
+                    merged.append((idx, apex_idx, ev))
+                    continue
+                if ev.action_type == "brake":
+                    merged[-1] = (idx, apex_idx, ev)
+                continue
+
         if gap_m < min_event_sep_m:
             if ev.action_type == "brake" and prev_ev.action_type != "brake":
-                merged[-1] = (idx, ev)
+                merged[-1] = (idx, apex_idx, ev)
                 continue
             if ev.action_type == prev_ev.action_type == "brake":
                 prev_speed = prev_ev.target_min_speed_kph or 999
                 cur_speed = ev.target_min_speed_kph or 999
                 if cur_speed < prev_speed:
-                    merged[-1] = (idx, ev)
+                    merged[-1] = (idx, apex_idx, ev)
                 continue
             if ev.action_type == prev_ev.action_type == "lift":
                 prev_throttle = prev_ev.target_throttle_pct or 100
                 cur_throttle = ev.target_throttle_pct or 100
                 if cur_throttle < prev_throttle:
-                    merged[-1] = (idx, ev)
+                    merged[-1] = (idx, apex_idx, ev)
                 continue
             continue
-        merged.append((idx, ev))
+        merged.append((idx, apex_idx, ev))
+
+    # Long-gap duplicate cleanup for brake events with near-identical targets.
+    compact: List[tuple[int, int, EngineerEvent]] = []
+    for idx, apex_idx, ev in merged:
+        if not compact:
+            compact.append((idx, apex_idx, ev))
+            continue
+        prev_idx, prev_apex_idx, prev_ev = compact[-1]
+        gap_m = cum[idx] - cum[prev_idx]
+        if ev.action_type == prev_ev.action_type == "brake" and gap_m < 260.0:
+            prev_speed = prev_ev.target_min_speed_kph or 999
+            cur_speed = ev.target_min_speed_kph or 999
+            if abs(cur_speed - prev_speed) <= 8 and abs(ev.target_gear - prev_ev.target_gear) <= 1:
+                if cur_speed < prev_speed:
+                    compact[-1] = (idx, apex_idx, ev)
+                continue
+        compact.append((idx, apex_idx, ev))
 
     # Final dedupe by start position.
-    events = [ev for _, ev in merged]
+    events = [ev for _, _, ev in compact]
     events.sort(key=lambda e: e.start_pct)
     deduped: List[EngineerEvent] = []
-    min_start_sep_pct = 0.0010
+    min_start_sep_pct = 0.0012
     for ev in events:
         if not deduped:
             deduped.append(ev)
