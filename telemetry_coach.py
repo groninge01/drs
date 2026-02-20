@@ -232,9 +232,9 @@ def build_action_cue(
     if action_target == "min-speed":
         min_kph = int(round(zone.min_speed_mps * 3.6))
         if zone.peak_brake < lift_cutoff:
-            cue = f"Lift, minimum corner speed about {min_kph} kilometers per hour"
+            cue = f"Lift, minimum speed about {min_kph} kilometers per hour"
         else:
-            cue = f"Minimum corner speed about {min_kph} kilometers per hour"
+            cue = f"Minimum speed about {min_kph} kilometers per hour"
     else:
         if zone.peak_brake < lift_cutoff:
             cue = "Lift"
@@ -371,10 +371,17 @@ def run_live(
                 and d_pct > action_pct
                 and (now - last_spoken_time) >= cue_cooldown_seconds
             ):
+                preview = build_action_cue(
+                    zone,
+                    gear,
+                    lift_cutoff,
+                    brake_tolerance_band,
+                    action_target,
+                )
                 if lead_callout is not None:
-                    speaker.say(f"Prepare for corner {lead_callout}.")
+                    speaker.say(f"Corner {lead_callout}. {preview}.")
                 else:
-                    speaker.say("Prepare for corner.")
+                    speaker.say(f"Corner coming up. {preview}.")
                 state.prepare_done = True
                 last_spoken_time = now
 
@@ -383,18 +390,7 @@ def run_live(
                 and d_pct <= action_pct
                 and (now - last_spoken_time) >= cue_cooldown_seconds
             ):
-                cue = build_action_cue(
-                    zone,
-                    gear,
-                    lift_cutoff,
-                    brake_tolerance_band,
-                    action_target,
-                )
-                if lead_callout is not None:
-                    cue = f"{lead_callout.capitalize()}. {cue}."
-                else:
-                    cue = f"Now. {cue}."
-                speaker.say(cue)
+                speaker.say("Brake now.")
                 state.action_done = True
                 last_spoken_time = now
 
