@@ -34,6 +34,7 @@ python3 telemetry_coach.py \
   --action-lead-seconds 0.85 \
   --brake-tolerance-band 8 \
   --lift-cutoff 0.18 \
+  --distance-callout-unit seconds \
   --voice-contains english \
   -c "data/your-reference-lap.csv"
 ```
@@ -47,8 +48,8 @@ python3 telemetry_coach.py \
 
 Example cue:
 
-- `Prepare for corner in 190 meters.`
-- `In 72 meters. Minimum corner speed about 121 kilometers per hour, downshift to gear 3.`
+- `Prepare for corner in 3 seconds.`
+- `In 1 seconds. Minimum corner speed about 121 kilometers per hour, downshift to gear 3.`
 
 ## Notes
 
@@ -61,6 +62,7 @@ Example cue:
 - `--lookahead-seconds`: higher means earlier warnings.
 - `--action-lead-seconds`: timing of the second-stage action call.
 - `--action-target`: `min-speed` (default) or `brake`.
+- `--distance-callout-unit`: `seconds` (default) or `meters`.
 - `--lift-cutoff`: brake peak below this value becomes a lift call.
 - `--brake-tolerance-band`: spoken +/- range around brake target.
 - `--min-lookahead-pct` / `--max-lookahead-pct`: clamp cue lead distance.

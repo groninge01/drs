@@ -182,6 +182,20 @@ def pct_to_meters(track_length_m: Optional[float], pct_delta: float) -> Optional
     return pct_delta * track_length_m
 
 
+def format_distance_callout(
+    distance_m: Optional[float], speed_mps: float, unit: str
+) -> Optional[str]:
+    if distance_m is None:
+        return None
+    if unit == "seconds":
+        if speed_mps <= 0.5:
+            return None
+        seconds = max(1, int(round(distance_m / speed_mps)))
+        return f"in {seconds} seconds"
+    meters = max(1, int(round(distance_m)))
+    return f"in {meters} meters"
+
+
 def build_action_cue(
     zone: BrakeZone,
     current_gear: int,
@@ -239,6 +253,7 @@ def run_live(
     lift_cutoff: float,
     brake_tolerance_band: int,
     action_target: str,
+    distance_callout_unit: str,
     cue_cooldown_seconds: float,
     voice_contains: Optional[str],
 ) -> None:
@@ -313,6 +328,7 @@ def run_live(
             state = stage_state.setdefault(key, ZoneAnnouncementState())
             d_pct = circular_delta(lap_pct, zone.start_pct)
             d_m = pct_to_meters(track_len, d_pct)
+            lead_callout = format_distance_callout(d_m, speed_mps, distance_callout_unit)
 
             if track_len:
                 action_pct = _clamp(
@@ -329,8 +345,8 @@ def run_live(
                 and d_pct > action_pct
                 and (now - last_spoken_time) >= cue_cooldown_seconds
             ):
-                if d_m is not None:
-                    speaker.say(f"Prepare for corner in {int(round(d_m))} meters.")
+                if lead_callout is not None:
+                    speaker.say(f"Prepare for corner {lead_callout}.")
                 else:
                     speaker.say("Prepare for corner.")
                 state.prepare_done = True
@@ -348,8 +364,8 @@ def run_live(
                     brake_tolerance_band,
                     action_target,
                 )
-                if d_m is not None:
-                    cue = f"In {int(round(d_m))} meters. {cue}."
+                if lead_callout is not None:
+                    cue = f"{lead_callout.capitalize()}. {cue}."
                 else:
                     cue = f"Now. {cue}."
                 speaker.say(cue)
@@ -392,6 +408,12 @@ def parse_args() -> argparse.Namespace:
         default="min-speed",
         help="Select action cue mode: minimum corner speed (default) or brake pressure",
     )
+    p.add_argument(
+        "--distance-callout-unit",
+        choices=["meters", "seconds"],
+        default="seconds",
+        help="Distance lead-in unit for prepare/action calls",
+    )
     p.add_argument("--cue-cooldown-seconds", type=float, default=1.0)
     p.add_argument(
         "--voice-contains",
@@ -421,6 +443,7 @@ def main() -> None:
         lift_cutoff=args.lift_cutoff,
         brake_tolerance_band=args.brake_tolerance_band,
         action_target=args.action_target,
+        distance_callout_unit=args.distance_callout_unit,
         cue_cooldown_seconds=args.cue_cooldown_seconds,
         voice_contains=args.voice_contains,
     )
