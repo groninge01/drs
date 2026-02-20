@@ -80,29 +80,40 @@ class SpeechWorker:
         if platform.system().lower().startswith("win") and pythoncom is not None:
             pythoncom.CoInitialize()
             com_initialized = True
-        engine = self._init_engine()
 
         try:
             while True:
                 text = self._queue.get()
                 print(f"[CUE] {text}")
-                try:
-                    engine.say(text)
-                    engine.runAndWait()
-                except Exception as e:  # pragma: no cover
-                    print(f"[WARN] TTS playback failed ({e}); retrying once.")
-                    try:
-                        engine = self._init_engine()
-                        engine.say(text)
-                        engine.runAndWait()
-                    except Exception as retry_error:
-                        print(f"[WARN] TTS retry failed ({retry_error}).")
+                self._speak_with_retry(text)
         finally:
             if com_initialized:
                 pythoncom.CoUninitialize()
 
+    def _speak_with_retry(self, text: str) -> None:
+        try:
+            self._speak_once(text)
+        except Exception as e:  # pragma: no cover
+            print(f"[WARN] TTS playback failed ({e}); retrying once.")
+            try:
+                self._speak_once(text)
+            except Exception as retry_error:  # pragma: no cover
+                print(f"[WARN] TTS retry failed ({retry_error}).")
+
+    def _speak_once(self, text: str) -> None:
+        engine = self._init_engine()
+        engine.say(text)
+        engine.runAndWait()
+        try:
+            engine.stop()
+        except Exception:
+            pass
+
     def _init_engine(self) -> "pyttsx3.Engine":
-        engine = pyttsx3.init()
+        if platform.system().lower().startswith("win"):
+            engine = pyttsx3.init(driverName="sapi5")
+        else:
+            engine = pyttsx3.init()
         engine.setProperty("rate", self._rate)
         if self._voice_contains:
             for voice in engine.getProperty("voices"):
@@ -312,6 +323,7 @@ def run_live(
     last_spoken_time = 0.0
     track_length_estimates: List[float] = []
     last_wait_log = 0.0
+    min_cue_speed_mps = 2.5
 
     print("Connected to iRacing SDK.")
     print("Listening to live telemetry. Press Ctrl+C to stop.")
@@ -329,6 +341,17 @@ def run_live(
         lap_pct = float(ir["LapDistPct"] or 0.0)
         speed_mps = float(ir["Speed"] or 0.0)
         gear = int(ir["Gear"] or 0)
+        on_track_raw = ir["IsOnTrackCar"]
+        on_track = bool(on_track_raw) if on_track_raw is not None else True
+
+        if not on_track or speed_mps < min_cue_speed_mps:
+            now = time.time()
+            if now - last_wait_log >= 3.0:
+                print("Waiting to drive... cues start once you're on track and moving.")
+                last_wait_log = now
+            last_pct = lap_pct
+            time.sleep(0.1)
+            continue
 
         if lap_pct < last_pct - 0.5:
             lap_count += 1
@@ -381,7 +404,8 @@ def run_live(
                 if lead_callout is not None:
                     speaker.say(f"Corner {lead_callout}. {preview}.")
                 else:
-                    speaker.say(f"Corner coming up. {preview}.")
+                    fallback_seconds = max(1, int(round(lookahead_seconds)))
+                    speaker.say(f"Corner in {fallback_seconds} seconds. {preview}.")
                 state.prepare_done = True
                 last_spoken_time = now
 
