@@ -3,8 +3,8 @@
 This app reads live iRacing telemetry, compares your current lap position to a reference Garage61 CSV, and speaks upcoming corner cues:
 
 - stage 1: prepare call
-- stage 2: action call with lift/brake + gear guidance
-- brake target with tolerance band
+- stage 2: action call with minimum corner speed (km/h) + gear guidance
+- optional brake pressure mode with tolerance band
 
 ## Files
 
@@ -48,7 +48,7 @@ python3 telemetry_coach.py \
 Example cue:
 
 - `Prepare for corner in 190 meters.`
-- `In 72 meters. Brake about 62 percent, plus minus 8, downshift to gear 3.`
+- `In 72 meters. Minimum corner speed about 121 kilometers per hour, downshift to gear 3.`
 
 ## Notes
 
@@ -60,10 +60,17 @@ Example cue:
 
 - `--lookahead-seconds`: higher means earlier warnings.
 - `--action-lead-seconds`: timing of the second-stage action call.
+- `--action-target`: `min-speed` (default) or `brake`.
 - `--lift-cutoff`: brake peak below this value becomes a lift call.
 - `--brake-tolerance-band`: spoken +/- range around brake target.
 - `--min-lookahead-pct` / `--max-lookahead-pct`: clamp cue lead distance.
 - `--cue-cooldown-seconds`: prevents repeated rapid callouts.
+
+Brake-pressure action cue mode:
+
+```bash
+python3 telemetry_coach.py -c "data/your-reference-lap.csv" --action-target brake
+```
 
 ## Build Windows Executable
 

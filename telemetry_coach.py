@@ -40,6 +40,7 @@ class BrakeZone:
     start_pct: float
     end_pct: float
     peak_brake: float
+    min_speed_mps: float
     min_gear: int
     approach_speed_mps: float
 
@@ -138,6 +139,7 @@ def extract_brake_zones(
             if zone_end - zone_start + 1 >= min_zone_len:
                 chunk = samples[zone_start : zone_end + 1]
                 peak_brake = max(x.brake for x in chunk)
+                min_speed_mps = min(x.speed_mps for x in chunk)
                 driving_gears = [x.gear for x in chunk if x.gear > 0]
                 min_gear = min(driving_gears) if driving_gears else max(chunk[0].gear, 1)
                 zones.append(
@@ -146,6 +148,7 @@ def extract_brake_zones(
                         start_pct=chunk[0].lap_pct,
                         end_pct=chunk[-1].lap_pct,
                         peak_brake=peak_brake,
+                        min_speed_mps=min_speed_mps,
                         min_gear=min_gear,
                         approach_speed_mps=chunk[0].speed_mps,
                     )
@@ -180,13 +183,24 @@ def pct_to_meters(track_length_m: Optional[float], pct_delta: float) -> Optional
 
 
 def build_action_cue(
-    zone: BrakeZone, current_gear: int, lift_cutoff: float, brake_band: int
+    zone: BrakeZone,
+    current_gear: int,
+    lift_cutoff: float,
+    brake_band: int,
+    action_target: str,
 ) -> str:
-    if zone.peak_brake < lift_cutoff:
-        cue = "Lift"
+    if action_target == "min-speed":
+        min_kph = int(round(zone.min_speed_mps * 3.6))
+        if zone.peak_brake < lift_cutoff:
+            cue = f"Lift, minimum corner speed about {min_kph} kilometers per hour"
+        else:
+            cue = f"Minimum corner speed about {min_kph} kilometers per hour"
     else:
-        target = int(round(zone.peak_brake * 100, 0))
-        cue = f"Brake about {target} percent, plus minus {brake_band}"
+        if zone.peak_brake < lift_cutoff:
+            cue = "Lift"
+        else:
+            target = int(round(zone.peak_brake * 100, 0))
+            cue = f"Brake about {target} percent, plus minus {brake_band}"
 
     if zone.min_gear < current_gear:
         downshift_count = current_gear - zone.min_gear
@@ -224,6 +238,7 @@ def run_live(
     action_lead_seconds: float,
     lift_cutoff: float,
     brake_tolerance_band: int,
+    action_target: str,
     cue_cooldown_seconds: float,
     voice_contains: Optional[str],
 ) -> None:
@@ -326,7 +341,13 @@ def run_live(
                 and d_pct <= action_pct
                 and (now - last_spoken_time) >= cue_cooldown_seconds
             ):
-                cue = build_action_cue(zone, gear, lift_cutoff, brake_tolerance_band)
+                cue = build_action_cue(
+                    zone,
+                    gear,
+                    lift_cutoff,
+                    brake_tolerance_band,
+                    action_target,
+                )
                 if d_m is not None:
                     cue = f"In {int(round(d_m))} meters. {cue}."
                 else:
@@ -365,6 +386,12 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="Spoken brake tolerance band in percent",
     )
+    p.add_argument(
+        "--action-target",
+        choices=["min-speed", "brake"],
+        default="min-speed",
+        help="Select action cue mode: minimum corner speed (default) or brake pressure",
+    )
     p.add_argument("--cue-cooldown-seconds", type=float, default=1.0)
     p.add_argument(
         "--voice-contains",
@@ -393,6 +420,7 @@ def main() -> None:
         action_lead_seconds=args.action_lead_seconds,
         lift_cutoff=args.lift_cutoff,
         brake_tolerance_band=args.brake_tolerance_band,
+        action_target=args.action_target,
         cue_cooldown_seconds=args.cue_cooldown_seconds,
         voice_contains=args.voice_contains,
     )
