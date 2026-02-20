@@ -273,6 +273,39 @@ def build_action_cue(
     return cue
 
 
+def _digit_word(n: int) -> str:
+    words = {
+        0: "zero",
+        1: "one",
+        2: "two",
+        3: "three",
+        4: "four",
+        5: "five",
+        6: "six",
+        7: "seven",
+        8: "eight",
+        9: "nine",
+    }
+    return words[n]
+
+
+def spell_number_digits(value: int) -> str:
+    value = max(0, value)
+    return "-".join(_digit_word(int(ch)) for ch in str(value))
+
+
+def build_short_prepare_cue(zone: BrakeZone, current_gear: int, seconds_to_corner: int) -> str:
+    min_kph = int(round(zone.min_speed_mps * 3.6))
+    speed_spoken = spell_number_digits(min_kph)
+    if zone.min_gear < current_gear:
+        gear_part = f"downshift to {zone.min_gear}"
+    elif zone.min_gear > current_gear:
+        gear_part = f"upshift to {zone.min_gear}"
+    else:
+        gear_part = f"gear {zone.min_gear}"
+    return f"In {seconds_to_corner} seconds: {speed_spoken}, {gear_part}."
+
+
 def estimate_track_length_m(values: List[float]) -> Optional[float]:
     if not values:
         return None
@@ -391,30 +424,20 @@ def run_live(
             if (
                 not state.prepare_done
                 and d_pct <= lookahead_pct
-                and d_pct > action_pct
-                and (now - last_spoken_time) >= cue_cooldown_seconds
             ):
-                preview = build_action_cue(
-                    zone,
-                    gear,
-                    lift_cutoff,
-                    brake_tolerance_band,
-                    action_target,
-                )
-                if lead_callout is not None:
-                    speaker.say(f"Corner {lead_callout}. {preview}.")
+                if d_m is not None and speed_mps > 0.5:
+                    seconds_to_corner = max(1, int(round(d_m / speed_mps)))
                 else:
-                    fallback_seconds = max(1, int(round(lookahead_seconds)))
-                    speaker.say(f"Corner in {fallback_seconds} seconds. {preview}.")
+                    seconds_to_corner = max(1, int(round(lookahead_seconds)))
+                speaker.say(build_short_prepare_cue(zone, gear, seconds_to_corner))
                 state.prepare_done = True
                 last_spoken_time = now
 
             if (
                 not state.action_done
                 and d_pct <= action_pct
-                and (now - last_spoken_time) >= cue_cooldown_seconds
             ):
-                speaker.say("Brake now.")
+                speaker.say("Now.")
                 state.action_done = True
                 last_spoken_time = now
 
