@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Speak driving cues from live iRacing telemetry using a reference Garage61 CSV."""
+"""CSV-led live race engineer for iRacing."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import csv
 import math
 import platform
 import queue
-import statistics
 import threading
 import time
 from dataclasses import dataclass
@@ -39,26 +38,27 @@ class RefSample:
     speed_mps: float
     lat: float
     lon: float
+    steering_angle: float
     brake: float
     throttle: float
     gear: int
 
 
 @dataclass
-class BrakeZone:
+class EngineerEvent:
     index: int
     start_pct: float
     apex_pct: float
     end_pct: float
-    action_type: str
-    peak_brake: float
-    min_speed_mps: float
-    min_gear: int
-    approach_speed_mps: float
+    action_type: str  # brake | lift
+    target_min_speed_kph: Optional[int]
+    target_throttle_pct: Optional[int]
+    target_gear: int
+    peak_brake_pct: int
 
 
 @dataclass
-class ZoneAnnouncementState:
+class EventAnnouncementState:
     prepare_done: bool = False
     action_done: bool = False
 
@@ -134,11 +134,30 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6_371_000.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dphi = p2 - p1
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2.0) ** 2
+    return 2.0 * r * math.asin(min(1.0, math.sqrt(a)))
+
+
 def load_reference_csv(path: Path) -> List[RefSample]:
     samples: List[RefSample] = []
     with path.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        required = {"LapDistPct", "Speed", "Lat", "Lon", "Brake", "Throttle", "Gear"}
+        required = {
+            "LapDistPct",
+            "Speed",
+            "Lat",
+            "Lon",
+            "SteeringWheelAngle",
+            "Brake",
+            "Throttle",
+            "Gear",
+        }
         missing = required - set(reader.fieldnames or [])
         if missing:
             raise ValueError(f"CSV is missing columns: {sorted(missing)}")
@@ -150,6 +169,7 @@ def load_reference_csv(path: Path) -> List[RefSample]:
                     speed_mps=float(row["Speed"]),
                     lat=float(row["Lat"]),
                     lon=float(row["Lon"]),
+                    steering_angle=float(row["SteeringWheelAngle"]),
                     brake=float(row["Brake"]),
                     throttle=float(row["Throttle"]),
                     gear=int(float(row["Gear"])),
@@ -157,325 +177,22 @@ def load_reference_csv(path: Path) -> List[RefSample]:
             )
 
     if len(samples) < 100:
-        raise ValueError("CSV has too few rows to build cue zones")
+        raise ValueError("CSV has too few rows to build events")
 
     samples.sort(key=lambda s: s.lap_pct)
     return samples
 
 
-def _is_local_minimum(values: List[float], i: int) -> bool:
-    return values[i] <= values[i - 1] and values[i] <= values[i + 1]
-
-
-def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    r = 6_371_000.0
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dphi = p2 - p1
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2.0) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2.0) ** 2
-    return 2.0 * r * math.asin(min(1.0, math.sqrt(a)))
-
-
-def _bearing_rad(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dlambda = math.radians(lon2 - lon1)
-    y = math.sin(dlambda) * math.cos(p2)
-    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dlambda)
-    return math.atan2(y, x)
-
-
-def _angle_diff_rad(a: float, b: float) -> float:
-    d = a - b
-    while d > math.pi:
-        d -= 2.0 * math.pi
-    while d < -math.pi:
-        d += 2.0 * math.pi
-    return d
-
-
-def _smooth(values: List[float], half_window: int) -> List[float]:
-    if half_window <= 0 or len(values) < 3:
-        return values[:]
-    out: List[float] = [0.0] * len(values)
-    n = len(values)
-    for i in range(n):
-        lo = max(0, i - half_window)
-        hi = min(n, i + half_window + 1)
-        out[i] = statistics.mean(values[lo:hi])
-    return out
-
-
-def _lookahead_indices(cum_dist: List[float], distance_m: float, circular: bool = False) -> List[int]:
-    n = len(cum_dist)
-    out = [n - 1] * n
-    if n == 0:
-        return out
-    if circular:
-        total_len = cum_dist[-1]
-        if total_len <= 0.0:
-            return out
-        for i in range(n):
-            target = cum_dist[i] + distance_m
-            if target <= total_len:
-                j = bisect.bisect_left(cum_dist, target)
-                out[i] = min(n - 1, j)
-            else:
-                wrapped = target - total_len
-                j = bisect.bisect_left(cum_dist, wrapped)
-                out[i] = min(n - 1, j)
-        return out
-    j = 0
-    for i in range(n):
-        if j < i:
-            j = i
-        target = cum_dist[i] + distance_m
-        while j < n - 1 and cum_dist[j] < target:
-            j += 1
-        out[i] = j
-    return out
-
-
-def _lookback_indices(cum_dist: List[float], distance_m: float, circular: bool = False) -> List[int]:
-    n = len(cum_dist)
-    out = [0] * n
-    if n == 0:
-        return out
-    if circular:
-        total_len = cum_dist[-1]
-        if total_len <= 0.0:
-            return out
-        for i in range(n):
-            target = cum_dist[i] - distance_m
-            if target >= 0.0:
-                j = bisect.bisect_left(cum_dist, target)
-                out[i] = min(n - 1, j)
-            else:
-                wrapped = target + total_len
-                j = bisect.bisect_left(cum_dist, wrapped)
-                out[i] = min(n - 1, j)
-        return out
-    j = n - 1
-    for i in range(n - 1, -1, -1):
-        if j > i:
-            j = i
-        target = cum_dist[i] - distance_m
-        while j > 0 and cum_dist[j] > target:
-            j -= 1
-        out[i] = j
-    return out
-
-
-def _forward_indices(start_idx: int, end_idx: int, n: int) -> List[int]:
-    if n <= 0:
-        return []
-    if start_idx <= end_idx:
-        return list(range(start_idx, end_idx + 1))
-    return list(range(start_idx, n)) + list(range(0, end_idx + 1))
-
-
-def _has_brake_reset(samples: List[RefSample], start_idx: int, end_idx: int, release_threshold: float = 0.05) -> bool:
-    if end_idx - start_idx < 4:
-        return False
-    valley = min(samples[j].brake for j in range(start_idx + 1, end_idx))
-    return valley <= release_threshold
-
-
-def extract_corners(samples: List[RefSample]) -> List[BrakeZone]:
-    n = len(samples)
-    if n < 200:
-        return []
-
-    seg_dist: List[float] = [0.0] * n
-    cum_dist: List[float] = [0.0] * n
-    heading: List[float] = [0.0] * n
-    for i in range(1, n):
-        d = _haversine_m(samples[i - 1].lat, samples[i - 1].lon, samples[i].lat, samples[i].lon)
-        seg_dist[i] = max(0.05, d)
-        cum_dist[i] = cum_dist[i - 1] + seg_dist[i]
-        heading[i] = _bearing_rad(samples[i - 1].lat, samples[i - 1].lon, samples[i].lat, samples[i].lon)
-    heading[0] = _bearing_rad(samples[-1].lat, samples[-1].lon, samples[0].lat, samples[0].lon)
-
-    look_ahead_120 = _lookahead_indices(cum_dist, 120.0, circular=True)
-    look_ahead_250 = _lookahead_indices(cum_dist, 250.0, circular=True)
-    look_ahead_500 = _lookahead_indices(cum_dist, 500.0, circular=True)
-    look_back_120 = _lookback_indices(cum_dist, 120.0, circular=True)
-    look_back_250 = _lookback_indices(cum_dist, 250.0, circular=True)
-
-    turn_score_deg = [0.0] * n
-    for i in range(1, n - 1):
-        j250 = look_ahead_250[i]
-        j500 = look_ahead_500[i]
-        turn250 = abs(math.degrees(_angle_diff_rad(heading[j250], heading[i])))
-        turn500 = abs(math.degrees(_angle_diff_rad(heading[j500], heading[i])))
-        # 250 m is responsive for close corners; 500 m catches long-radius bends early.
-        turn_score_deg[i] = max(turn250, turn500 * 0.72)
-
-    turn_score_deg = _smooth(turn_score_deg, half_window=3)
-    nonzero_scores = sorted(x for x in turn_score_deg if x > 0.0)
-    if not nonzero_scores:
-        return []
-
-    min_peak_score = max(8.0, nonzero_scores[int(len(nonzero_scores) * 0.70)])
-    speed = [s.speed_mps for s in samples]
-
-    raw_candidates: List[tuple[int, float]] = []
-    for i in range(2, n - 2):
-        if turn_score_deg[i] < min_peak_score:
-            continue
-        if turn_score_deg[i] >= turn_score_deg[i - 1] and turn_score_deg[i] > turn_score_deg[i + 1]:
-            raw_candidates.append((i, turn_score_deg[i]))
-
-    if not raw_candidates:
-        return []
-
-    # Keep strongest peaks first, then enforce spatial spacing to avoid duplicates.
-    raw_candidates.sort(key=lambda item: item[1], reverse=True)
-    selected_centers: List[int] = []
-    min_center_sep_m = 55.0
-    for center_idx, _score in raw_candidates:
-        if any(abs(cum_dist[center_idx] - cum_dist[other]) < min_center_sep_m for other in selected_centers):
-            continue
-        selected_centers.append(center_idx)
-
-    # Add brake-onset candidates as a safety net, so real braking corners are not missed.
-    brake_event_threshold = 0.08
-    brake_event_sep_m = 45.0
-    for i in range(1, n):
-        if samples[i - 1].brake < brake_event_threshold <= samples[i].brake:
-            if any(abs(cum_dist[i] - cum_dist[other]) < brake_event_sep_m for other in selected_centers):
-                continue
-            selected_centers.append(i)
-    selected_centers.sort()
-
-    corners: List[BrakeZone] = []
-    used_apex_dist: List[float] = []
-    min_action_sep_m = 45.0
-    min_apex_sep_m = 40.0
-
-    throttle_drop_threshold = 0.10
-    brake_start_threshold = 0.06
-    last_kept_action_idx: Optional[int] = None
-    last_kept_apex_idx: Optional[int] = None
-    last_kept_action_type: Optional[str] = None
-
-    for center_idx in selected_centers:
-        apex_lo = look_back_120[center_idx]
-        apex_hi = look_ahead_120[center_idx]
-        if apex_hi <= apex_lo:
-            continue
-        apex_idx = min(range(apex_lo, apex_hi + 1), key=lambda j: speed[j])
-        if any(abs(cum_dist[apex_idx] - d) < min_apex_sep_m for d in used_apex_dist):
-            continue
-
-        action_search_start = max(1, look_back_250[apex_idx])
-        action_idx = max(1, look_back_120[apex_idx])
-        action_type = "flat"
-        search_window = _forward_indices(action_search_start, apex_idx, n)
-        if len(search_window) < 2:
-            continue
-
-        brake_idx: Optional[int] = None
-        for j in reversed(search_window):
-            prev_j = j - 1 if j > 0 else n - 1
-            if samples[prev_j].brake < brake_start_threshold <= samples[j].brake:
-                brake_idx = j
-                break
-        if brake_idx is None:
-            peak_brake_pre = max(samples[j].brake for j in search_window)
-            if peak_brake_pre >= 0.12:
-                last_brake_idx = max(
-                    (j for j in search_window if samples[j].brake >= 0.12),
-                    default=None,
-                )
-                if last_brake_idx is not None:
-                    j = last_brake_idx
-                    guard = 0
-                    while guard < n:
-                        prev_j = j - 1 if j > 0 else n - 1
-                        if prev_j == action_search_start:
-                            break
-                        if samples[prev_j].brake < brake_start_threshold:
-                            break
-                        j = prev_j
-                        guard += 1
-                    brake_idx = j
-
-        lift_idx: Optional[int] = None
-        for j in reversed(search_window):
-            prev_j = j - 1 if j > 0 else n - 1
-            throttle_drop = samples[prev_j].throttle - samples[j].throttle
-            if throttle_drop >= throttle_drop_threshold and samples[j].throttle <= 0.98:
-                lift_idx = j
-                break
-
-        if brake_idx is not None:
-            action_idx = brake_idx
-            action_type = "brake"
-        elif lift_idx is not None:
-            action_idx = lift_idx
-            action_type = "lift"
-
-        if last_kept_action_idx is not None:
-            action_gap_m = abs(cum_dist[action_idx] - cum_dist[last_kept_action_idx])
-            apex_gap_m = abs(cum_dist[apex_idx] - cum_dist[last_kept_apex_idx or last_kept_action_idx])
-            is_close = action_gap_m < min_action_sep_m
-            if is_close:
-                allow_close_brake_pair = (
-                    action_type == "brake"
-                    and last_kept_action_type == "brake"
-                    and apex_gap_m >= 22.0
-                    and _has_brake_reset(samples, last_kept_action_idx, action_idx)
-                )
-                if not allow_close_brake_pair:
-                    continue
-
-        seg_start = look_back_120[apex_idx]
-        seg_end = look_ahead_120[apex_idx]
-        seg_window = _forward_indices(seg_start, seg_end, n)
-        seg_speed_hi = max(speed[j] for j in seg_window)
-        seg_speed_lo = min(speed[j] for j in seg_window)
-        speed_drop_kph = (seg_speed_hi - seg_speed_lo) * 3.6
-        turn_near = abs(math.degrees(_angle_diff_rad(heading[look_ahead_120[apex_idx]], heading[look_back_120[apex_idx]])))
-        turn_far = abs(math.degrees(_angle_diff_rad(heading[look_ahead_250[apex_idx]], heading[look_back_120[apex_idx]])))
-        turn_strength = max(turn_near, turn_far * 0.7)
-
-        if action_type == "flat":
-            if turn_strength < 13.0:
-                continue
-            if speed_drop_kph < 10.0:
-                continue
-
-        end_i = min(n - 1, look_ahead_120[apex_idx])
-        chunk = [samples[j] for j in _forward_indices(action_idx, end_i, n)]
-        driving_gears = [x.gear for x in chunk if x.gear > 0]
-        min_gear = min(driving_gears) if driving_gears else max(samples[action_idx].gear, 1)
-        approach_i = max(0, look_back_120[action_idx])
-        min_speed_idx = min(seg_window, key=lambda j: speed[j])
-
-        corners.append(
-            BrakeZone(
-                index=len(corners),
-                start_pct=samples[action_idx].lap_pct,
-                apex_pct=samples[apex_idx].lap_pct,
-                end_pct=samples[end_i].lap_pct,
-                action_type=action_type,
-                peak_brake=max(x.brake for x in chunk),
-                min_speed_mps=samples[min_speed_idx].speed_mps,
-                min_gear=min_gear,
-                approach_speed_mps=samples[approach_i].speed_mps,
-            )
+def build_cumulative_distance(samples: List[RefSample]) -> List[float]:
+    cum = [0.0] * len(samples)
+    for i in range(1, len(samples)):
+        cum[i] = cum[i - 1] + _haversine_m(
+            samples[i - 1].lat,
+            samples[i - 1].lon,
+            samples[i].lat,
+            samples[i].lon,
         )
-        used_apex_dist.append(cum_dist[apex_idx])
-        last_kept_action_idx = action_idx
-        last_kept_apex_idx = apex_idx
-        last_kept_action_type = action_type
-
-    corners.sort(key=lambda z: z.start_pct)
-    for idx, corner in enumerate(corners):
-        corner.index = idx
-    return corners
+    return cum
 
 
 def circular_delta(from_pct: float, to_pct: float) -> float:
@@ -483,195 +200,249 @@ def circular_delta(from_pct: float, to_pct: float) -> float:
     return d if d >= 0 else d + 1.0
 
 
-def next_zone(
-    zones: List[BrakeZone], current_pct: float, lookahead_pct: float
-) -> Optional[BrakeZone]:
-    best: Optional[BrakeZone] = None
+def _forward_indices(start_idx: int, end_idx: int, n: int) -> List[int]:
+    if start_idx <= end_idx:
+        return list(range(start_idx, end_idx + 1))
+    return list(range(start_idx, n)) + list(range(0, end_idx + 1))
+
+
+def _lookahead_indices(cum_dist: List[float], distance_m: float) -> List[int]:
+    n = len(cum_dist)
+    if n == 0:
+        return []
+    total_len = cum_dist[-1]
+    if total_len <= 0.0:
+        return [0] * n
+
+    extended = cum_dist + [x + total_len for x in cum_dist]
+    out = [0] * n
+    for i in range(n):
+        target = cum_dist[i] + distance_m
+        j = bisect.bisect_left(extended, target, lo=i, hi=i + n)
+        out[i] = j % n
+    return out
+
+
+def _distance_between(cum_dist: List[float], i: int, j: int) -> float:
+    total_len = cum_dist[-1]
+    if total_len <= 0.0:
+        return 0.0
+    d = abs(cum_dist[j] - cum_dist[i])
+    return min(d, total_len - d)
+
+
+def extract_engineer_events(samples: List[RefSample]) -> List[EngineerEvent]:
+    n = len(samples)
+    cum = build_cumulative_distance(samples)
+    if n < 50 or cum[-1] <= 100.0:
+        return []
+
+    ahead_120 = _lookahead_indices(cum, 120.0)
+    ahead_250 = _lookahead_indices(cum, 250.0)
+
+    brake_onset = 0.08
+    brake_release = 0.04
+    lift_drop = 0.12
+    lift_throttle = 0.90
+
+    candidates: List[tuple[int, str, float]] = []  # idx, type, strength
+
+    for i in range(1, n):
+        prev = samples[i - 1]
+        cur = samples[i]
+
+        if prev.brake < brake_onset <= cur.brake:
+            strength = cur.brake - prev.brake
+            candidates.append((i, "brake", strength + 1.0))
+            continue
+
+        drop = prev.throttle - cur.throttle
+        if drop >= lift_drop and cur.throttle <= lift_throttle and cur.brake < 0.03:
+            candidates.append((i, "lift", drop))
+
+    if not candidates:
+        return []
+
+    # Keep close events when action changes; dedupe very similar same-action triggers.
+    candidates.sort(key=lambda x: x[0])
+    filtered: List[tuple[int, str, float]] = []
+    min_same_action_sep_m = 35.0
+    for idx, action, strength in candidates:
+        if not filtered:
+            filtered.append((idx, action, strength))
+            continue
+
+        prev_idx, prev_action, prev_strength = filtered[-1]
+        gap_m = _distance_between(cum, prev_idx, idx)
+        if gap_m < min_same_action_sep_m and action == prev_action:
+            if strength > prev_strength:
+                filtered[-1] = (idx, action, strength)
+            continue
+        if gap_m < 10.0:
+            continue
+        filtered.append((idx, action, strength))
+
+    indexed_events: List[tuple[int, EngineerEvent]] = []
+    for idx, action, _strength in filtered:
+        end_idx = ahead_120[idx]
+        eval_idx = ahead_250[idx]
+        window = _forward_indices(idx, eval_idx, n)
+        if len(window) < 3:
+            continue
+
+        min_speed_idx = min(window, key=lambda j: samples[j].speed_mps)
+        min_speed_kph = int(round(samples[min_speed_idx].speed_mps * 3.6))
+        min_gear = min((samples[j].gear for j in window if samples[j].gear > 0), default=max(samples[idx].gear, 1))
+        peak_brake = max(samples[j].brake for j in window)
+        min_throttle = min(samples[j].throttle for j in window)
+        approach_speed_kph = int(round(samples[idx].speed_mps * 3.6))
+        speed_drop_kph = max(0, approach_speed_kph - min_speed_kph)
+
+        # User rule: lift = throttle goes down with no/very little braking (<10%).
+        if peak_brake >= 0.10:
+            final_action = "brake"
+            target_speed = min_speed_kph
+            target_throttle = None
+        else:
+            # Must show a real lift signature, not tiny noise.
+            if min_throttle > 95 and speed_drop_kph < 5:
+                continue
+            final_action = "lift"
+            target_speed = None
+            target_throttle = int(round(min_throttle * 100.0))
+
+        indexed_events.append(
+            (
+                idx,
+                EngineerEvent(
+                    index=0,
+                    start_pct=samples[idx].lap_pct,
+                    apex_pct=samples[min_speed_idx].lap_pct,
+                    end_pct=samples[end_idx].lap_pct,
+                    action_type=final_action,
+                    target_min_speed_kph=target_speed,
+                    target_throttle_pct=target_throttle,
+                    target_gear=min_gear,
+                    peak_brake_pct=int(round(peak_brake * 100.0)),
+                ),
+            )
+        )
+
+    if not indexed_events:
+        return []
+
+    # Merge very close events; prefer brake when clustered.
+    indexed_events.sort(key=lambda x: x[0])
+    merged: List[tuple[int, EngineerEvent]] = []
+    min_event_sep_m = 45.0
+    for idx, ev in indexed_events:
+        if not merged:
+            merged.append((idx, ev))
+            continue
+        prev_idx, prev_ev = merged[-1]
+        gap_m = cum[idx] - cum[prev_idx]
+        if gap_m < min_event_sep_m:
+            if ev.action_type == "brake" and prev_ev.action_type != "brake":
+                merged[-1] = (idx, ev)
+                continue
+            if ev.action_type == prev_ev.action_type == "brake":
+                prev_speed = prev_ev.target_min_speed_kph or 999
+                cur_speed = ev.target_min_speed_kph or 999
+                if cur_speed < prev_speed:
+                    merged[-1] = (idx, ev)
+                continue
+            if ev.action_type == prev_ev.action_type == "lift":
+                prev_throttle = prev_ev.target_throttle_pct or 100
+                cur_throttle = ev.target_throttle_pct or 100
+                if cur_throttle < prev_throttle:
+                    merged[-1] = (idx, ev)
+                continue
+            continue
+        merged.append((idx, ev))
+
+    # Final dedupe by start position.
+    events = [ev for _, ev in merged]
+    events.sort(key=lambda e: e.start_pct)
+    deduped: List[EngineerEvent] = []
+    min_start_sep_pct = 0.0010
+    for ev in events:
+        if not deduped:
+            deduped.append(ev)
+            continue
+        prev = deduped[-1]
+        if circular_delta(prev.start_pct, ev.start_pct) < min_start_sep_pct:
+            if ev.action_type == "brake" and prev.action_type != "brake":
+                deduped[-1] = ev
+            continue
+        deduped.append(ev)
+
+    for i, ev in enumerate(deduped):
+        ev.index = i
+    return deduped
+
+
+def next_event(events: List[EngineerEvent], current_pct: float, lookahead_pct: float) -> Optional[EngineerEvent]:
+    best: Optional[EngineerEvent] = None
     best_delta = 2.0
-    for zone in zones:
-        d = circular_delta(current_pct, zone.start_pct)
+    for ev in events:
+        d = circular_delta(current_pct, ev.start_pct)
         if d <= lookahead_pct and d < best_delta:
-            best = zone
+            best = ev
             best_delta = d
     return best
 
 
-def pct_to_meters(track_length_m: Optional[float], pct_delta: float) -> Optional[float]:
-    if not track_length_m:
-        return None
-    return pct_delta * track_length_m
-
-
-def format_distance_callout(
-    distance_m: Optional[float], speed_mps: float, unit: str
-) -> Optional[str]:
-    if distance_m is None:
-        return None
-    if unit == "seconds":
-        if speed_mps <= 0.5:
-            return None
-        seconds = max(1, int(round(distance_m / speed_mps)))
-        return f"in {seconds} seconds"
-    meters = max(1, int(round(distance_m)))
-    return f"in {meters} meters"
-
-
-def build_action_cue(
-    zone: BrakeZone,
-    current_gear: int,
-    lift_cutoff: float,
-    brake_band: int,
-    action_target: str,
-) -> str:
-    if action_target == "min-speed":
-        min_kph = int(round(zone.min_speed_mps * 3.6))
-        if zone.peak_brake < lift_cutoff:
-            cue = f"Lift, minimum speed about {min_kph} kilometers per hour"
-        else:
-            cue = f"Minimum speed about {min_kph} kilometers per hour"
-    else:
-        if zone.peak_brake < lift_cutoff:
-            cue = "Lift"
-        else:
-            target = int(round(zone.peak_brake * 100, 0))
-            cue = f"Brake about {target} percent, plus minus {brake_band}"
-
-    if zone.min_gear < current_gear:
-        downshift_count = current_gear - zone.min_gear
-        if downshift_count == 1:
-            cue += f", downshift to gear {zone.min_gear}"
-        else:
-            cue += (
-                f", downshift {downshift_count} gears to gear {zone.min_gear}"
-            )
-    elif zone.min_gear > current_gear:
-        upshift_count = zone.min_gear - current_gear
-        if upshift_count == 1:
-            cue += f", upshift to gear {zone.min_gear}"
-        else:
-            cue += f", upshift {upshift_count} gears to gear {zone.min_gear}"
-    else:
-        cue += f", hold gear {current_gear}"
-
-    return cue
-
-
-def _digit_word(n: int) -> str:
-    words = {
-        0: "zero",
-        1: "one",
-        2: "two",
-        3: "three",
-        4: "four",
-        5: "five",
-        6: "six",
-        7: "seven",
-        8: "eight",
-        9: "nine",
-    }
-    return words[n]
-
-
-def spell_number_digits(value: int) -> str:
-    value = max(0, value)
-    return "-".join(_digit_word(int(ch)) for ch in str(value))
-
-
-def build_short_prepare_cue(zone: BrakeZone, current_gear: int, seconds_to_corner: int) -> str:
-    min_kph = int(round(zone.min_speed_mps * 3.6))
-    speed_spoken = spell_number_digits(min_kph)
-    if zone.min_gear < current_gear:
-        gear_part = f"downshift to {zone.min_gear}"
-    elif zone.min_gear > current_gear:
-        gear_part = f"upshift to {zone.min_gear}"
-    else:
-        gear_part = f"gear {zone.min_gear}"
-    return f"In {seconds_to_corner} seconds: {speed_spoken}, {gear_part}."
-
-
-def build_short_target_phrase(zone: BrakeZone, current_gear: int) -> str:
-    min_kph = int(round(zone.min_speed_mps * 3.6))
-    speed_spoken = spell_number_digits(min_kph)
-    if zone.min_gear < current_gear:
-        gear_part = f"downshift to {zone.min_gear}"
-    elif zone.min_gear > current_gear:
-        gear_part = f"upshift to {zone.min_gear}"
-    else:
-        gear_part = f"gear {zone.min_gear}"
-    return f"{speed_spoken}, {gear_part}"
-
-
-def is_significant_action(zone: BrakeZone) -> bool:
-    speed_drop_mps = max(0.0, zone.approach_speed_mps - zone.min_speed_mps)
-    if zone.action_type == "brake":
-        return zone.peak_brake >= 0.12 or speed_drop_mps >= 4.0
-    if zone.action_type == "lift":
-        return speed_drop_mps >= 2.5
-    return False
-
-
-def reference_track_length_m(samples: List[RefSample]) -> Optional[float]:
-    if len(samples) < 2:
-        return None
-    total = 0.0
-    for i in range(1, len(samples)):
-        total += _haversine_m(samples[i - 1].lat, samples[i - 1].lon, samples[i].lat, samples[i].lon)
-    return total if total > 100.0 else None
-
-
-def close_followup_zone(
-    zones: List[BrakeZone], zone: BrakeZone, track_length_m: Optional[float], max_gap_m: float = 170.0
-) -> Optional[BrakeZone]:
-    if track_length_m is None:
-        return None
-    if zone.action_type != "brake":
-        return None
-    next_idx = zone.index + 1
-    if next_idx >= len(zones):
-        return None
-    candidate = zones[next_idx]
-    if candidate.action_type != "brake":
-        return None
-    d_pct = circular_delta(zone.start_pct, candidate.start_pct)
-    d_m = d_pct * track_length_m
-    if 0.0 < d_m <= max_gap_m:
-        return candidate
-    return None
-
-
 def estimate_track_length_m(values: List[float]) -> Optional[float]:
-    if not values:
-        return None
     if len(values) < 5:
         return None
-    return statistics.median(values)
+    return sorted(values)[len(values) // 2]
+
+
+def gear_instruction(current_gear: int, target_gear: int) -> str:
+    if target_gear < current_gear:
+        n = current_gear - target_gear
+        if n == 1:
+            return f"downshift to {target_gear}"
+        return f"downshift {n} gears to {target_gear}"
+    if target_gear > current_gear:
+        n = target_gear - current_gear
+        if n == 1:
+            return f"upshift to {target_gear}"
+        return f"upshift {n} gears to {target_gear}"
+    return f"hold gear {target_gear}"
+
+
+def build_prepare_cue(event: EngineerEvent, current_gear: int, seconds_to_event: int) -> str:
+    shift = gear_instruction(current_gear, event.target_gear)
+    if event.action_type == "brake":
+        target_speed = event.target_min_speed_kph if event.target_min_speed_kph is not None else 0
+        return f"In {seconds_to_event} seconds: brake to about {target_speed} kilometers per hour, {shift}."
+
+    target_throttle = event.target_throttle_pct if event.target_throttle_pct is not None else 0
+    return f"In {seconds_to_event} seconds: lift to about {target_throttle} percent, {shift}."
 
 
 def run_live(
     csv_path: Path,
     lookahead_seconds: float,
-    min_lookahead_pct: float,
-    max_lookahead_pct: float,
+    min_lookahead_meters: float,
+    max_lookahead_meters: float,
     action_lead_seconds: float,
-    lift_cutoff: float,
-    brake_tolerance_band: int,
-    action_target: str,
-    distance_callout_unit: str,
-    cue_cooldown_seconds: float,
-    now_lead_seconds: float,
     voice_contains: Optional[str],
 ) -> None:
     if irsdk is None:
         raise RuntimeError("irsdk is not installed. Run: pip install -r requirements.txt")
 
     samples = load_reference_csv(csv_path)
-    zones = extract_corners(samples=samples)
-    if not zones:
-        raise RuntimeError("No corner events found in the reference CSV")
-    ref_track_len_m = reference_track_length_m(samples)
+    events = extract_engineer_events(samples)
+    if not events:
+        raise RuntimeError("No actionable events found in the reference CSV")
+
+    n_brake = sum(1 for e in events if e.action_type == "brake")
+    n_lift = sum(1 for e in events if e.action_type == "lift")
 
     print(f"Loaded {len(samples)} reference samples")
-    print(f"Extracted {len(zones)} corners")
+    print(f"Extracted {len(events)} engineer events ({n_brake} brake, {n_lift} lift)")
 
     ir = irsdk.IRSDK()
     while not ir.startup():
@@ -682,11 +453,9 @@ def run_live(
 
     last_pct = 0.0
     lap_count = 0
-    stage_state: dict[tuple[int, int], ZoneAnnouncementState] = {}
-    last_spoken_time = 0.0
+    state_map: dict[tuple[int, int], EventAnnouncementState] = {}
     track_length_estimates: List[float] = []
     last_wait_log = 0.0
-    min_cue_speed_mps = 2.5
 
     print("Connected to iRacing SDK.")
     print("Listening to live telemetry. Press Ctrl+C to stop.")
@@ -704,10 +473,9 @@ def run_live(
         lap_pct = float(ir["LapDistPct"] or 0.0)
         speed_mps = float(ir["Speed"] or 0.0)
         gear = int(ir["Gear"] or 0)
-        on_track_raw = ir["IsOnTrackCar"]
-        on_track = bool(on_track_raw) if on_track_raw is not None else True
+        on_track = bool(ir["IsOnTrackCar"]) if ir["IsOnTrackCar"] is not None else True
 
-        if not on_track or speed_mps < min_cue_speed_mps:
+        if not on_track or speed_mps < 2.5:
             now = time.time()
             if now - last_wait_log >= 3.0:
                 print("Waiting to drive... cues start once you're on track and moving.")
@@ -718,7 +486,7 @@ def run_live(
 
         if lap_pct < last_pct - 0.5:
             lap_count += 1
-            stage_state = {k: v for k, v in stage_state.items() if k[0] >= lap_count - 1}
+            state_map = {k: v for k, v in state_map.items() if k[0] >= lap_count - 1}
         last_pct = lap_pct
 
         lap_dist = ir["LapDist"]
@@ -728,108 +496,66 @@ def run_live(
                 track_length_estimates.pop(0)
 
         track_len = estimate_track_length_m(track_length_estimates)
-        if track_len:
-            lookahead_pct = _clamp((speed_mps * lookahead_seconds) / track_len, min_lookahead_pct, max_lookahead_pct)
-        else:
-            lookahead_pct = 0.006
+        if track_len is None:
+            time.sleep(0.03)
+            continue
 
-        zone = next_zone(zones, lap_pct, lookahead_pct)
-        now = time.time()
-        if zone is not None:
-            key = (lap_count, zone.index)
-            state = stage_state.setdefault(key, ZoneAnnouncementState())
-            d_pct = circular_delta(lap_pct, zone.start_pct)
-            d_m = pct_to_meters(track_len, d_pct)
-            # Trigger "Now." close to the reference brake-onset sample (zone.start_pct),
-            # not at a large lead time. Window is short to align with actual brake application.
-            if track_len:
-                action_pct = _clamp(
-                    (speed_mps * now_lead_seconds) / track_len,
-                    min_lookahead_pct * 0.05,
-                    max_lookahead_pct * 0.40,
-                )
-            else:
-                action_pct = min_lookahead_pct * 0.20
+        adaptive_lookahead_m = _clamp(
+            speed_mps * lookahead_seconds,
+            min_lookahead_meters,
+            max_lookahead_meters,
+        )
+        lookahead_pct = _clamp(adaptive_lookahead_m / track_len, 0.001, 0.04)
+        event = next_event(events, lap_pct, lookahead_pct)
+        if event is None:
+            time.sleep(0.03)
+            continue
 
-            if (
-                not state.prepare_done
-                and d_pct <= lookahead_pct
-            ):
-                if d_m is not None and speed_mps > 0.5:
-                    seconds_to_corner = max(1, int(round(d_m / speed_mps)))
-                else:
-                    seconds_to_corner = max(1, int(round(lookahead_seconds)))
-                followup = close_followup_zone(zones, zone, ref_track_len_m)
-                if followup is not None:
-                    first_part = build_short_target_phrase(zone, gear)
-                    second_part = build_short_target_phrase(followup, zone.min_gear)
-                    speaker.say(f"In {seconds_to_corner} seconds: {first_part} then {second_part}.")
-                    followup_key = (lap_count, followup.index)
-                    followup_state = stage_state.setdefault(followup_key, ZoneAnnouncementState())
-                    followup_state.prepare_done = True
-                    followup_state.action_done = True
-                else:
-                    speaker.say(build_short_prepare_cue(zone, gear, seconds_to_corner))
-                state.prepare_done = True
-                last_spoken_time = now
+        key = (lap_count, event.index)
+        state = state_map.setdefault(key, EventAnnouncementState())
 
-            if (
-                not state.action_done
-                and d_pct <= action_pct
-            ):
-                if is_significant_action(zone):
-                    speaker.say("Now.")
-                state.action_done = True
-                last_spoken_time = now
+        d_pct = circular_delta(lap_pct, event.start_pct)
+        d_m = d_pct * track_len
+        seconds_to_event = max(1, int(round(d_m / max(0.5, speed_mps))))
+
+        if not state.prepare_done and d_pct <= lookahead_pct:
+            speaker.say(build_prepare_cue(event, gear, seconds_to_event))
+            state.prepare_done = True
+
+        action_pct = _clamp((speed_mps * action_lead_seconds) / track_len, 0.0005, 0.01)
+        if not state.action_done and d_pct <= action_pct:
+            speaker.say("Now.")
+            state.action_done = True
 
         time.sleep(0.03)
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Live iRacing telemetry coach with spoken lift/brake/gear cues"
+    p = argparse.ArgumentParser(description="CSV-led live iRacing digital race engineer")
+    p.add_argument("-c", "--csv", type=Path, default=None, help="Reference lap CSV exported from Garage61")
+    p.add_argument(
+        "--lookahead-seconds",
+        type=float,
+        default=5.0,
+        help="Dynamic lookahead based on speed (distance = speed * seconds)",
     )
     p.add_argument(
-        "-c",
-        "--csv",
-        type=Path,
-        default=None,
-        help="Reference lap CSV exported from Garage61",
+        "--min-lookahead-meters",
+        type=float,
+        default=110.0,
+        help="Minimum dynamic lookahead distance in meters (low-speed floor)",
     )
-    p.add_argument("--lookahead-seconds", type=float, default=2.2)
-    p.add_argument("--min-lookahead-pct", type=float, default=0.003)
-    p.add_argument("--max-lookahead-pct", type=float, default=0.015)
+    p.add_argument(
+        "--max-lookahead-meters",
+        type=float,
+        default=420.0,
+        help="Maximum dynamic lookahead distance in meters (high-speed cap)",
+    )
     p.add_argument(
         "--action-lead-seconds",
         type=float,
-        default=0.85,
-        help="Second-stage call timing before brake point",
-    )
-    p.add_argument("--lift-cutoff", type=float, default=0.16)
-    p.add_argument(
-        "--brake-tolerance-band",
-        type=int,
-        default=8,
-        help="Spoken brake tolerance band in percent",
-    )
-    p.add_argument(
-        "--action-target",
-        choices=["min-speed", "brake"],
-        default="min-speed",
-        help="Select action cue mode: minimum corner speed (default) or brake pressure",
-    )
-    p.add_argument(
-        "--distance-callout-unit",
-        choices=["meters", "seconds"],
-        default="seconds",
-        help="Distance lead-in unit for prepare/action calls",
-    )
-    p.add_argument("--cue-cooldown-seconds", type=float, default=1.0)
-    p.add_argument(
-        "--now-lead-seconds",
-        type=float,
-        default=0.45,
-        help="Advance for 'Now.' cue to compensate speech latency",
+        default=0.40,
+        help="How early to speak 'Now.' before the reference action point",
     )
     p.add_argument(
         "--voice-contains",
@@ -837,6 +563,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional substring match for TTS voice name",
     )
+
     args = p.parse_args()
     if args.csv is None:
         print("[WARN] No CSV supplied. Use -c/--csv with a Garage61 reference file.")
@@ -845,6 +572,12 @@ def parse_args() -> argparse.Namespace:
         p.error(f"CSV file not found: {args.csv}")
     if args.csv.suffix.lower() != ".csv":
         p.error(f"Expected a .csv file: {args.csv}")
+    if args.lookahead_seconds <= 0.3:
+        p.error("--lookahead-seconds must be > 0.3")
+    if args.min_lookahead_meters <= 30.0:
+        p.error("--min-lookahead-meters must be > 30")
+    if args.max_lookahead_meters <= args.min_lookahead_meters:
+        p.error("--max-lookahead-meters must be greater than --min-lookahead-meters")
     return args
 
 
@@ -853,15 +586,9 @@ def main() -> None:
     run_live(
         csv_path=args.csv,
         lookahead_seconds=args.lookahead_seconds,
-        min_lookahead_pct=args.min_lookahead_pct,
-        max_lookahead_pct=args.max_lookahead_pct,
+        min_lookahead_meters=args.min_lookahead_meters,
+        max_lookahead_meters=args.max_lookahead_meters,
         action_lead_seconds=args.action_lead_seconds,
-        lift_cutoff=args.lift_cutoff,
-        brake_tolerance_band=args.brake_tolerance_band,
-        action_target=args.action_target,
-        distance_callout_unit=args.distance_callout_unit,
-        cue_cooldown_seconds=args.cue_cooldown_seconds,
-        now_lead_seconds=args.now_lead_seconds,
         voice_contains=args.voice_contains,
     )
 
