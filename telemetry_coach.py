@@ -346,9 +346,7 @@ def parse_args() -> argparse.Namespace:
         "-c",
         "--csv",
         type=Path,
-        default=Path(
-            "data/Garage 61 - Timm Sachse - Mercedes-AMG GT4 - Nürburgring Combined (Gesamtstrecke VLN) - 08.43.344 - 01KFRXKEB2S8XEXGEXV4ZACME7.csv"
-        ),
+        default=None,
         help="Reference lap CSV exported from Garage61",
     )
     p.add_argument("--lookahead-seconds", type=float, default=2.2)
@@ -375,6 +373,9 @@ def parse_args() -> argparse.Namespace:
         help="Optional substring match for TTS voice name",
     )
     args = p.parse_args()
+    if args.csv is None:
+        print("[WARN] No CSV supplied. Use -c/--csv with a Garage61 reference file.")
+        raise SystemExit(1)
     if not args.csv.exists():
         p.error(f"CSV file not found: {args.csv}")
     if args.csv.suffix.lower() != ".csv":

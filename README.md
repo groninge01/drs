@@ -23,12 +23,6 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-python3 telemetry_coach.py
-```
-
-Choose a specific reference CSV:
-
-```bash
 python3 telemetry_coach.py -c "data/your-reference-lap.csv"
 ```
 
