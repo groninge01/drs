@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import platform
 import queue
 import statistics
 import threading
@@ -23,6 +24,11 @@ try:
     import pyttsx3
 except ImportError:  # pragma: no cover
     pyttsx3 = None
+
+try:
+    import pythoncom  # type: ignore
+except ImportError:  # pragma: no cover
+    pythoncom = None
 
 
 @dataclass
@@ -70,21 +76,41 @@ class SpeechWorker:
                 print(f"[CUE] {text}")
             return
 
+        com_initialized = False
+        if platform.system().lower().startswith("win") and pythoncom is not None:
+            pythoncom.CoInitialize()
+            com_initialized = True
+        engine = self._init_engine()
+
+        try:
+            while True:
+                text = self._queue.get()
+                print(f"[CUE] {text}")
+                try:
+                    engine.say(text)
+                    engine.runAndWait()
+                except Exception as e:  # pragma: no cover
+                    print(f"[WARN] TTS playback failed ({e}); retrying once.")
+                    try:
+                        engine = self._init_engine()
+                        engine.say(text)
+                        engine.runAndWait()
+                    except Exception as retry_error:
+                        print(f"[WARN] TTS retry failed ({retry_error}).")
+        finally:
+            if com_initialized:
+                pythoncom.CoUninitialize()
+
+    def _init_engine(self) -> "pyttsx3.Engine":
         engine = pyttsx3.init()
         engine.setProperty("rate", self._rate)
-
         if self._voice_contains:
             for voice in engine.getProperty("voices"):
                 name = (voice.name or "").lower()
                 if self._voice_contains.lower() in name:
                     engine.setProperty("voice", voice.id)
                     break
-
-        while True:
-            text = self._queue.get()
-            print(f"[CUE] {text}")
-            engine.say(text)
-            engine.runAndWait()
+        return engine
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
