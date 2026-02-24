@@ -7,7 +7,7 @@ import pyttsx3
 # CONFIG
 # ==============================
 
-NOTES_FILE = "pace_notes_output.json"
+NOTES_FILE = "data/pace_notes_output.json"
 UPDATE_RATE = 0.02  # 50Hz check
 
 

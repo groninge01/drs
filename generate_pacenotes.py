@@ -267,7 +267,7 @@ if __name__ == "__main__":
 
     notes = generate_notes(csv_path)
 
-    output_file = "pace_notes_output.json"
+    output_file = "data/pace_notes_output.json"
     with open(output_file, "w") as f:
         json.dump(notes, f, indent=2)
 
