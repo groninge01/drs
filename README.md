@@ -1,18 +1,16 @@
-# iRacing Telemetry Voice Coach
+# iRacing Pacenote Tools
 
-This app reads live iRacing telemetry, compares your current lap position to a reference Garage61 CSV, and speaks upcoming corner cues:
+This repo contains two scripts:
 
-- stage 1: prepare call
-- stage 2: action call with minimum corner speed (km/h) + gear guidance
-- optional brake pressure mode with tolerance band
+- `generate_pacenotes.py`: builds pace notes from a Garage61 telemetry CSV and writes `pace_notes_output.json`.
+- `iracing_pacenote_engine.py`: reads `pace_notes_output.json`, watches live iRacing lap position, and speaks notes at the configured trigger points.
 
-## Files
+## Requirements
 
-- `telemetry_coach.py`: main app
-- `requirements.txt`: Python dependencies
-- `data/...csv`: your reference lap
+- Python 3.10+
+- iRacing running (for live engine playback)
 
-## Setup
+Install dependencies:
 
 ```bash
 python3 -m venv .venv
@@ -20,106 +18,52 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Run
+## 1) Generate Pace Notes JSON
 
 ```bash
-python3 telemetry_coach.py -c "data/your-reference-lap.csv"
+python3 generate_pacenotes.py data/your-reference-lap.csv
 ```
 
-Optional flags:
+Output:
+
+- `pace_notes_output.json` in the project root
+
+## 2) Run Live Pacenote Engine
 
 ```bash
-python3 telemetry_coach.py \
-  --lookahead-seconds 2.4 \
-  --action-lead-seconds 0.85 \
-  --brake-tolerance-band 8 \
-  --lift-cutoff 0.18 \
-  --distance-callout-unit seconds \
-  --voice-contains english \
-  -c "data/your-reference-lap.csv"
+python3 iracing_pacenote_engine.py
 ```
 
-## How It Works
+Notes:
 
-1. Loads the Garage61 CSV and extracts braking zones.
-2. Connects to iRacing via `irsdk`.
-3. Tracks live `LapDistPct`, speed, and gear.
-4. Looks ahead to the next zone and speaks two-stage cues before turn-in.
+- `iracing_pacenote_engine.py` expects `pace_notes_output.json` in the same folder.
+- If iRacing is not on track, the engine waits and keeps polling.
 
-Example cue:
+## Build Windows EXE (Engine)
 
-- `Prepare for corner in 3 seconds.`
-- `In 1 seconds. Minimum corner speed about 121 kilometers per hour, downshift to gear 3.`
-
-## Notes
-
-- iRacing must be running and on track for live telemetry.
-- If `pyttsx3` is unavailable, cues are printed to terminal instead of spoken.
-- The app assumes your reference lap and current session are the same layout/car style.
-
-## Tuning
-
-- `--lookahead-seconds`: higher means earlier warnings.
-- `--action-lead-seconds`: timing of the second-stage action call.
-- `--action-target`: `min-speed` (default) or `brake`.
-- `--distance-callout-unit`: `seconds` (default) or `meters`.
-- `--lift-cutoff`: brake peak below this value becomes a lift call.
-- `--brake-tolerance-band`: spoken +/- range around brake target.
-- `--min-lookahead-pct` / `--max-lookahead-pct`: clamp cue lead distance.
-- `--cue-cooldown-seconds`: prevents repeated rapid callouts.
-
-Brake-pressure action cue mode:
-
-```bash
-python3 telemetry_coach.py -c "data/your-reference-lap.csv" --action-target brake
-```
-
-## Build Windows Executable
-
-Install minimal Python from PowerShell:
-
-```powershell
-winget install -e --id Python.Python.3.12
-py -V
-```
-
-Build `telemetry-coach.exe`:
+Build a standalone `iracing-pacenote-engine.exe` with PyInstaller:
 
 ```powershell
 cd C:\path\to\drs
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -r requirements.txt pyinstaller
-pyinstaller --onefile --name telemetry-coach telemetry_coach.py
+pip install -r requirements.txt
+pyinstaller --onefile --name iracing-pacenote-engine iracing_pacenote_engine.py
 ```
 
-If install fails with `No matching distribution found for irsdk`, update deps and retry:
+Output executable:
+
+- `dist\iracing-pacenote-engine.exe`
+
+Run it:
 
 ```powershell
-python -m pip install --upgrade pip
-pip uninstall -y irsdk
-pip install -r requirements.txt pyinstaller
+.\dist\iracing-pacenote-engine.exe
 ```
 
-Executable output:
-
-- `dist\telemetry-coach.exe`
-
-Run example:
-
-```powershell
-.\dist\telemetry-coach.exe -c "data\your-reference-lap.csv"
-```
-
-If script activation is blocked:
+If PowerShell script execution is blocked:
 
 ```powershell
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
-
-## Next Improvements
-
-- map zones to named corners
-- separate cues into two-stage calls ("brake soon" then "brake now")
-- calibrate brake/gear targets by pace delta to reference
